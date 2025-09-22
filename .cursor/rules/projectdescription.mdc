@@ -1,0 +1,132 @@
+---
+description: "Backend architecture and MVP plan for a Rails-based multi-tenant platform to create and manage custom AI agents. Businesses request an agent, the platform automatically builds it, integrates it with their systems, and bills them monthly; agents are accessed via API keys."
+globs:
+  - "**/*.rb"
+  - "**/*.yml"
+  - "**/*.json"
+  - "**/*.md"
+alwaysApply: true
+---
+
+# Product overview (core intent)
+
+This product is a SaaS platform where **a business can come, request an AI agent that automates a workflow inside their business, and receive a running AI agent hosted on our platform**. Think of it as “putting a person into their business — but it’s an AI agent that lives in our platform, integrates into the customer’s systems, and is accessible by the customer via API keys.” The business pays a monthly fee (subscription + usage) to keep the agent running.
+
+Key guarantees:
+- The business requests an agent via the website or API.
+- The platform automatically builds a domain-specific agent (prompt templates, knowledge ingestion, tools, connectors).
+- The agent is hosted and executed in our platform (isolated per-tenant namespace).
+- The customer integrates the agent with their systems via API keys, connectors, and optional inbound webhooks or an on-prem connector.
+- Billing is monthly (subscription + usage). API keys gate and meter access.
+
+---
+
+# 1. Core ideas / Architecture Overview
+
+- **API-full Rails app (Rails app with UI + API)**  
+  Stack: Postgres + Redis + Sidekiq for background processing.  
+
+- **Multi-tenant model**  
+  Organization / User with per-org API keys, per-agent billing, and per-org isolation.
+
+- **Agent as a first-class resource**  
+  - Versions/config (prompt templates, tools, policies)  
+  - Knowledge sources (documents, websites, embeddings)  
+  - Integration configuration (connectors / webhooks / SDK keys)  
+  - Runtime state (conversations, logs, metrics)  
+
+- **Request → Auto-build → Integrate runtime** (high-level flow)
+  1. Customer submits **AgentRequest** (form + sample data / integration details).  
+  2. Platform validates request and optionally asks clarifying Qs.  
+  3. **Auto-provision pipeline**:
+     - Generate a domain-aware system prompt (role_prompt template + domain variables).
+     - Ingest provided knowledge (documents, site crawl, API schema).
+     - Create embeddings + vector index.
+     - Configure allowed tools (e.g., DB query, calendar, HTTP, SQL runner) per customer's chosen connectors.
+     - Run smoke tests (sample queries) and produce QA report.
+  4. If tests pass, agent transitions to **deployed** state and gets credentials (API keys) and integration instructions.
+  5. Customer uses the API keys or connectors to call the agent; platform meters usage and bills monthly.
+
+- **Orchestrator / Runtime**  
+  - Executes LLM calls, tool calls, and memory lookups; runs inside Sidekiq workers or isolated runtime pods for security and scaling.  
+  - Each agent runs in a namespaced environment with resource/time budgets and observability.
+
+- **Pluggable layers**  
+  - LLM providers: OpenAI, Anthropic, local LLMs.  
+  - Vector DBs: Pinecone, Milvus, Postgres + pgvector.  
+  - Connector types: REST webhook, OAuth integrations (e.g., Google Calendar), database read-only adapters, inbound webhooks, and optional on-prem secure connector for enterprise data.
+
+- **Tools & connectors**  
+  - Tools are explicit, enabled per-agent, and restricted by policy (e.g., `can_access_tools: ["search","calendar","db_query"]`).  
+  - Connectors are configured during request or by admin and provide credentials / scopes for the agent.
+
+- **Observability & Safety**  
+  - Tracing per-request (LLM calls, tool calls), logs, metrics, and audit trail.  
+  - DLP, profanity/content filters, and manual escalation flows.  
+  - Per-org encryption keys and RBAC for access control.
+
+---
+
+# 2. Product flow & lifecycle (detailed)
+
+1. **Agent request stage**
+   - UI + API: `POST /agent_requests` with structured fields:
+     - business_name, contact, agent_goal, sample_data/examples, integration_type (e.g., REST webhook, DB read), required tools, SLA level.
+   - Store `AgentRequest` and kick off `AgentProvisionJob`.
+
+2. **Provisioning / Auto-build**
+   - `AgentProvisionJob` runs steps:
+     - Normalize request & generate agent config (role_prompt + tool list).
+     - Ingest any uploaded sources (documents, CSV, sample DB schema).
+     - Chunk + embed docs → push to vector DB scoped to org.
+     - Create initial `agent_version` with config snapshot.
+     - Run automated validation suite (sample Q->expected response checks).
+   - If validation fails, mark request `needs_human_review` and surface UI for operator editing.
+
+3. **Integration step**
+   - Provide multiple integration options:
+     - **API (recommended)**: the customer uses an API key (Authorization: `ApiKey <token>`) to call `POST /agents/:id/query` or `POST /runtime/:agent_id/invoke`.
+     - **Webhook / outbound**: platform can call customer webhooks when agent triggers actions.
+     - **OAuth connectors**: e.g., Google Workspace, Slack — agent acts on behalf of customer with scoped access.
+     - **DB adapter**: read-only connector to a customer's DB (via secure tunnel or on-prem connector).
+     - **On-prem connector (enterprise)**: a small appliance or agent that establishes secure outbound-only tunnel to the platform for sensitive data—no inbound access required.
+   - Integration configuration is stored on `Agent.integration_settings` (encrypted).
+
+4. **Deployment & access**
+   - Agent enters `deployed` state with an Active `agent_version`.  
+   - Present customer with:
+     - API credentials (org API key + agent id).
+     - Example SDK snippets (curl, Ruby, JavaScript).
+     - Integration guide (webhooks, OAuth flows).
+   - Provide a test sandbox endpoint for initial smoke tests.
+
+5. **Runtime & monitoring**
+   - All calls to agent go through the orchestrator with per-call tracing and quotas.  
+   - Platform provides UI for logs, usage, and performance, and an admin screen to `pause` or `revoke` agent access.
+
+6. **Billing**
+   - Pricing model: monthly subscription for hosted agent + usage (tokens, tool calls, external API calls).  
+   - Usage is stored as `UsageRecord` and invoiced monthly.  
+   - API keys gate meters; revoke/rotate keys from admin UI.
+
+---
+
+# 3. Data Model (core tables / models) — additions for product vision
+
+```txt
+organizations (id, name, plan, settings, api_key, billing_meta, created_at)
+users (id, org_id, email, role, encrypted_password)
+agent_requests (id, org_id, user_id, agent_goal, sample_data_refs, integration_type, status, created_at)
+agents (id, org_id, name, description, default_prompt, config(jsonb), status, integration_settings:jsonb, billing_plan, created_at)
+agent_versions (id, agent_id, version_number, config_snapshot, validator_report, created_at)
+knowledge_sources (id, org_id, agent_id, type, metadata, status)
+documents (id, knowledge_source_id, filename, content_type, blob ref)
+chunks (id, document_id, text, chunk_hash, tokens)
+embeddings (id, chunk_id, vector_reference, created_at)
+conversations (id, agent_id, org_id, user_id, metadata)
+messages (id, conversation_id, role, content, response_metadata)
+tools (id, org_id, name, type, config_json, enabled)
+tool_runs (id, tool_id, request_json, response_json, success, latency)
+integration_logs (id, agent_id, type, payload, response, success, created_at)
+usage_records (id, org_id, agent_id, api_key_id, type, units, cost, timestamp)
+api_keys (id, organization_id, user_id, name, token_digest, scopes, revoked_at, last_used_at)
